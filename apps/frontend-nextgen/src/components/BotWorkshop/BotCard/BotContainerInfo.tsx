@@ -6,6 +6,10 @@ import React from 'react';
 
 export interface BotContainerInfoProps {
   bot: BotDomain;
+  /** 已解析的请求身份；缺失时不发起容器接口请求。 */
+  userId?: string;
+  /** 列表库存声明的 Owner/协作者容器查看资格。 */
+  canView?: boolean;
   onOpen: (bot: BotDomain) => void;
 }
 
@@ -13,11 +17,16 @@ function isEligible(bot: BotDomain) {
   return bot.deployment === 'cloud' && bot.serviceMode === 'service' && bot.lifecycle === 'running';
 }
 
-/** 运行态服务 Bot 的容器概览。列表接口未携带 summary 时，仅为当前页合格 Bot 请求一次容器快照。 */
-export function BotContainerInfo({ bot, onOpen }: BotContainerInfoProps) {
+/**
+ * 服务 Bot 列表的「容器信息」单元格。
+ *
+ * 老版本只在独立列内展示“活跃数 / 实例总数”，并通过悬浮文案提示点击查看详情。
+ * 列表接口未携带 summary 时，仅为当前页合格 Bot 请求一次容器快照。
+ */
+export function BotContainerInfo({ bot, userId, canView = true, onOpen }: BotContainerInfoProps) {
   const [snapshot, setSnapshot] = React.useState<ContainerSnapshot>();
   const [failed, setFailed] = React.useState(false);
-  const eligible = isEligible(bot);
+  const eligible = Boolean(userId) && canView && isEligible(bot);
 
   React.useEffect(() => {
     if (!eligible) return undefined;
@@ -25,7 +34,7 @@ export function BotContainerInfo({ bot, onOpen }: BotContainerInfoProps) {
     setSnapshot(undefined);
     setFailed(false);
     void botContainerService
-      .list(bot.id)
+      .list(bot.id, userId!)
       .then((next) => {
         if (active) setSnapshot(next);
       })
@@ -35,11 +44,11 @@ export function BotContainerInfo({ bot, onOpen }: BotContainerInfoProps) {
     return () => {
       active = false;
     };
-  }, [bot.id, eligible]);
+  }, [bot.id, eligible, userId]);
 
-  if (!eligible) return null;
+  if (!eligible) return <span className="select-none text-sm text-muted-foreground">—</span>;
   const summary = snapshot?.summary;
-  const label = summary ? `容器 ${summary.healthy}/${summary.total}` : failed ? '容器实例' : '容器加载中';
+  const label = summary ? `${summary.healthy}/${summary.total}` : failed ? '加载失败' : '加载中…';
   const hasIssue = Boolean(summary && (summary.abnormal > 0 || summary.unknown > 0));
   const toneClass = failed
     ? 'border-border text-muted-foreground'
@@ -51,14 +60,15 @@ export function BotContainerInfo({ bot, onOpen }: BotContainerInfoProps) {
       variant="outline"
       size="sm"
       aria-label={`查看 ${bot.name} 容器实例`}
-      className={toneClass}
+      className={`min-w-[78px] justify-center font-medium ${toneClass}`}
       leftIcon={<Boxes aria-hidden className="size-3.5" />}
       onClick={(event) => {
         event.stopPropagation();
         onOpen(bot);
       }}
     >
-      {label}
+      <span>{label}</span>
+      {summary ? <span className="sr-only">，共 {summary.total} 个实例，{summary.healthy} 个活跃，点击查看详情</span> : null}
     </Button>
   );
 }

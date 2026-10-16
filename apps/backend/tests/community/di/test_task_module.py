@@ -6,7 +6,12 @@ from agentclaw.community.adapters.http.task.auth import (
 )
 from agentclaw.community.api.bot_discover_service import BotDiscoverServiceProtocol
 from agentclaw.community.api.bot_public_service import BotPublicServiceProtocol
+from agentclaw.community.api.cron_relay_service import CronRelayServiceProtocol
 from agentclaw.community.api.task.task_service import TaskServiceProtocol
+from agentclaw.community.core.task.forum.browsing.cron_setup import (
+    BbsBrowseCronManager,
+)
+from agentclaw.community.di.config import TaskDispatchConfig
 from agentclaw.community.core.task.task_runner.callback_correlation import (
     CallbackCorrelationRegistry,
     InMemoryCallbackCorrelationRegistry,
@@ -46,6 +51,31 @@ class _StubDiscoverModule(Module):
         return _BP()  # type: ignore[return-value]
 
 
+class _StubBbsCronModule(Module):
+    """BBS cron-manager dependencies with fixture-only values."""
+
+    @singleton
+    @provider
+    def cron_relay(self) -> CronRelayServiceProtocol:
+        return object()  # type: ignore[return-value]
+
+    @singleton
+    @provider
+    def task_dispatch(self) -> TaskDispatchConfig:
+        return TaskDispatchConfig(
+            backend_url="http://backend.example",
+            task_search_skill_enabled=False,
+            skill_report_enabled=True,
+        )
+
+
+def test_task_module_wires_bbs_browse_cron_manager():
+    injector = Injector([TaskModule(), _StubDiscoverModule(), _StubBbsCronModule()])
+    manager = injector.get(BbsBrowseCronManager)
+    assert manager is injector.get(BbsBrowseCronManager)
+    assert manager._backend_base_url == "http://backend.example"
+
+
 def test_task_module_binds_callback_singletons():
     inj = Injector([TaskModule(), _StubDiscoverModule()])
     # 新增 callback 服务绑定
@@ -59,23 +89,6 @@ def test_task_module_binds_callback_singletons():
     assert inj.get(TaskServiceProtocol) is inj.get(TaskServiceProtocol)
     assert inj.get(CallbackCorrelationRegistry) is inj.get(CallbackCorrelationRegistry)
     assert inj.get(CallbackAuthenticator) is inj.get(CallbackAuthenticator)
-
-
-def test_callback_origin_uses_bcs_task_callback_url_and_ignores_paths():
-    """TaskModule extracts the configured BCS callback origin without profile branches."""
-    assert TaskModule._callback_origin("") == "http://localhost:8888"
-    assert TaskModule._callback_origin("not a url") == "http://localhost:8888"
-    assert TaskModule._callback_origin("http://local:8888") == "http://local:8888"
-    assert (
-        TaskModule._callback_origin(
-            "https://agentclaw-pre.example.test/api/economy/governance/card-callback"
-        )
-        == "https://agentclaw-pre.example.test"
-    )
-    assert (
-        TaskModule._callback_origin("https://be.local:8888/path?x=1")
-        == "https://be.local:8888"
-    )
 
 
 def test_task_module_uses_keyword_discovery_in_every_profile(monkeypatch):
@@ -165,6 +178,9 @@ def test_task_service_degrades_when_merchant_bindings_are_not_registered(monkeyp
     )
     monkeypatch.setenv("OCB_TASK_HARNESS_ENABLED", "0")
     svc = module.TaskModule().task_service(
-        _Graph(), object(), TaskDispatchConfig(), _Injector()
+        _Graph(), object(),
+        TaskDispatchConfig(backend_url="https://backend.example"),
+        _Injector(),
     )
     assert isinstance(svc, module.TaskService)
+    assert svc._api_base_url == "https://backend.example"

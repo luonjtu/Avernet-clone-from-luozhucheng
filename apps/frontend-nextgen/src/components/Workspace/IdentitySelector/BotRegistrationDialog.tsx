@@ -1,3 +1,4 @@
+import { getCapabilities } from '@/capabilities';
 import {
   Button,
   Empty,
@@ -13,10 +14,14 @@ import {
 } from '@/components/ui';
 import { useBotRegistrationToken } from '@/pages/Workspace/hooks/useBotRegistrationToken';
 import { Check, Copy, MessageSquare, RefreshCw, Terminal } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 
+import { PoolabRegistrationPanel } from './PoolabRegistrationPanel';
 import { QwenWorkRegistrationPanel } from './QwenWorkRegistrationPanel';
 
+// engine 增加 'poolab' 由 getPoolabBridgeInstallation() 门控：Open Core 默认 null → 不渲染该 Tab；
+// internal overlay 注入脚本/指南 URL 后启用。
+type RegistrationEngine = string;
 type AccessMode = 'self' | 'auto';
 
 interface BotRegistrationDialogProps {
@@ -33,7 +38,11 @@ function formatExpiresAt(expiresAt: number | null): string | null {
 }
 
 export function BotRegistrationDialog({ open, onClose }: BotRegistrationDialogProps) {
-  const [engine, setEngine] = useState<'openclaw' | 'qwenwork'>('openclaw');
+  const panelCapability = getCapabilities().getAdditionalBotRegistrationPanels?.();
+  const additionalPanels = panelCapability?.status === 'available' ? panelCapability.value : [];
+  const poolabEnabled = getCapabilities().getPoolabBridgeInstallation().value !== null;
+  const [engine, setEngine] = useState<RegistrationEngine>('openclaw');
+  const AdditionalPanel = additionalPanels.find((panel) => panel.id === engine)?.Panel;
   const [mode, setMode] = useState<AccessMode>('self');
   const [copied, setCopied] = useState(false);
   const copiedTimeoutRef = useRef<number | null>(null);
@@ -76,7 +85,7 @@ export function BotRegistrationDialog({ open, onClose }: BotRegistrationDialogPr
           <ModalDescription className="leading-5">选择 Bot 类型，按对应指南完成接入。</ModalDescription>
         </ModalHeader>
 
-        <Segmented
+        <Segmented<RegistrationEngine>
           aria-label="Bot 类型"
           value={engine}
           onChange={setEngine}
@@ -84,10 +93,18 @@ export function BotRegistrationDialog({ open, onClose }: BotRegistrationDialogPr
           options={[
             { value: 'openclaw', label: 'OpenClaw' },
             { value: 'qwenwork', label: '千问办公' },
+            ...additionalPanels.map(({ id, label }) => ({ value: id, label })),
+            ...(poolabEnabled ? [{ value: 'poolab' as const, label: 'Poolab' }] : []),
           ]}
         />
-        {engine === 'qwenwork' ? (
+        {AdditionalPanel ? (
+          <Suspense fallback={<p role="status">正在加载接入指南…</p>}>
+            <AdditionalPanel open={open} />
+          </Suspense>
+        ) : engine === 'qwenwork' ? (
           <QwenWorkRegistrationPanel open={open} />
+        ) : engine === 'poolab' ? (
+          <PoolabRegistrationPanel open={open} />
         ) : (
           <>
             <section className="space-y-2" aria-label="OpenClaw 接入方式">

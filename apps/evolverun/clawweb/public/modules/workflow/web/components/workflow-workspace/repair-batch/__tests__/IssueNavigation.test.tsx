@@ -178,8 +178,8 @@ it('does not restore a cached generation action after another page discovers an 
   await act(async () => { await client.invalidateQueries({ queryKey: ['repair-issue-previews', 'wf'], predicate: query => query.getObserversCount() > 0 }) })
   await user.click(within(screen.getByRole('region', { name: '问题分页' })).getByRole('button', { name: '上一页' }))
   await screen.findByRole('checkbox', { name: '选择 retry' })
-  expect(screen.getByRole('region', { name: '本次修复操作' })).toHaveTextContent('已有修复任务')
-  expect(screen.getByRole('button', { name: '生成修复草稿（1）' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: '继续现有任务' })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '生成优化草稿（1）' })).toBeEnabled()
 })
 
 it('keeps cached suggestions visible during background validation and removes them on a forbidden response', async () => {
@@ -214,7 +214,7 @@ it('keeps suggestions reachable when the preview byte budget omits all their ite
   const checkbox = await within(dialog).findByRole('checkbox', { name: '选择 retry' })
   expect(checkbox).toBeEnabled()
   await user.click(checkbox)
-  expect(within(dialog).getByRole('button', { name: '生成修复草稿（1）' })).toBeEnabled()
+  expect(within(dialog).getByRole('button', { name: '生成优化草稿（1）' })).toBeEnabled()
 })
 
 it('does not scan suggestions twice when initial workflow permission finishes loading', async () => {
@@ -244,7 +244,7 @@ it('keeps repair context usable when the issue endpoint fails before returning a
   const checkbox = await within(dialog).findByRole('checkbox', { name: '选择 retry' })
   expect(checkbox).toBeEnabled()
   await user.click(checkbox)
-  expect(within(dialog).getByRole('button', { name: '生成修复草稿（1）' })).toBeEnabled()
+  expect(within(dialog).getByRole('button', { name: '生成优化草稿（1）' })).toBeEnabled()
 })
 
 it('turns and filters issue pages while batching suggestion previews for the visible signatures', async () => {
@@ -276,15 +276,15 @@ it('selects directly in the issue list and shows unavailable generation beside t
   </QueryClientProvider>)
   await user.click(await choices().findByRole('checkbox', { name: '选择 retry' }))
   const bar = screen.getByRole('region', { name: '本次修复操作' })
-  expect(within(bar).getByText(/已选 1 条建议/)).toBeVisible()
+  expect(within(bar).getByText(/已选 1 个问题/)).toBeVisible()
   expect(within(bar).getByText(/生成服务尚未接入/)).toBeVisible()
-  expect(within(bar).getByRole('button', { name: '生成修复草稿（1）' })).toBeDisabled()
+  expect(within(bar).getByRole('button', { name: '生成优化草稿（1）' })).toBeDisabled()
   expect(requests.filter(url => url.pathname.includes('/candidates'))).toHaveLength(1)
   expect(requests.filter(url => url.pathname.includes('/items/'))).toHaveLength(0)
   await user.click(within(screen.getByText('node-0', { selector: 'span' }).closest('article')!).getByRole('button', { name: '问题详情' }))
   await user.click(screen.getByRole('button', { name: '修复建议' }))
   const drawer = screen.getByRole('dialog', { name: '问题详情' })
-  expect(within(drawer).getByRole('button', { name: '生成修复草稿（1）' })).toBeDisabled()
+  expect(within(drawer).getByRole('button', { name: '生成优化草稿（1）' })).toBeDisabled()
   expect(within(drawer).getByText(/生成服务尚未接入/)).toBeVisible()
   expect(screen.queryByRole('button', { name: '确认修复范围' })).not.toBeInTheDocument()
 })
@@ -339,8 +339,8 @@ it('retains selections across issue pages and reviews their actual titles before
   await user.click(choices().getByRole('checkbox', { name: '选择 timeout' }))
   await user.click(within(screen.getByRole('dialog', { name: '问题详情' })).getByRole('button', { name: '关闭' }))
   await user.click(within(screen.getByRole('region', { name: '问题分页' })).getByRole('button', { name: '下一页' }))
-  await waitFor(() => expect(screen.getByRole('button', { name: '生成修复草稿（2）' })).toBeEnabled())
-  await user.click(screen.getByRole('button', { name: '生成修复草稿（2）' }))
+  await waitFor(() => expect(screen.getByRole('button', { name: '生成优化草稿（2）' })).toBeEnabled())
+  await user.click(screen.getByRole('button', { name: '生成优化草稿（2）' }))
   const confirmation = screen.getByRole('region', { name: 'Workflow 修复工作区' })
   expect(within(confirmation).getAllByText('retry')[0]).toBeVisible()
   expect(within(confirmation).getAllByText('timeout')[0]).toBeVisible()
@@ -376,11 +376,14 @@ it('retains conflicting sources for candidate review without silently choosing a
   await user.click(await choices().findByRole('checkbox', { name: '选择 600' }))
   await user.click(choices().getByRole('checkbox', { name: '选择 90' }))
   await user.click(within(screen.getByRole('dialog', { name: '问题详情' })).getByRole('button', { name: '关闭' }))
-  await user.click(screen.getByRole('button', { name: '生成修复草稿（2）' }))
+  expect(screen.getByRole('button', { name: '生成优化草稿（2）' })).toBeDisabled()
+  expect(screen.getByRole('alert')).toHaveTextContent('冲突')
+  expect(screen.getByRole('alert')).toHaveTextContent('fetch · /executor/timeoutMs')
+  expect(screen.getByRole('alert')).toHaveTextContent('600')
+  expect(screen.getByRole('alert')).toHaveTextContent('90')
+  await user.click(screen.getByRole('checkbox', { name: '选择 90' }))
+  await user.click(screen.getByRole('button', { name: '生成优化草稿（1）' }))
   const confirmation = screen.getByRole('region', { name: 'Workflow 修复工作区' })
-  expect(within(confirmation).getByRole('alert')).toHaveTextContent('结构冲突')
-  expect(within(confirmation).getByRole('button', { name: '生成 Pack 草稿' })).toBeEnabled()
-  await user.click(within(confirmation).getAllByRole('button', { name: '移除' })[1])
   expect(within(confirmation).getByRole('button', { name: '生成 Pack 草稿' })).toBeEnabled()
 })
 
@@ -419,4 +422,20 @@ it('pages suggestions independently and preserves explicit selections without se
   await user.click(choices().getByRole('checkbox', { name: '选择 suggestion-20' }))
   await user.click(screen.getByRole('button', { name: '上一页建议' }))
   expect(await choices().findByRole('checkbox', { name: '选择 suggestion-0' })).toBeChecked()
+})
+
+it('blocks generation inside the selection workspace itself while a selected conflict remains', async () => {
+  const items = [600, 90].map(value => ({ ...item(String(value)),
+    proposal: { summary: `超时${value}`, operations: [{ nodeId: 'fetch', path: '/executor/timeoutMs', value }] } }))
+  const generate = vi.fn()
+  render(<RepairSelectionWorkspace workflowId="wf" includeHistorical={false} refreshToken={0} selected={items.map(i => i.itemId)} selectedItems={items}
+    instructions="" busy={false} reason="" error="" onInstructions={vi.fn()} onToggle={vi.fn()} onResult={vi.fn()}
+    onDetail={vi.fn()} onGenerate={generate} onBack={vi.fn()} />)
+  await screen.findByRole('button', { name: '生成 Pack 草稿' })
+  await waitFor(() => expect(screen.queryByText('读取建议…')).not.toBeInTheDocument())
+  const button = screen.getByRole('button', { name: '生成 Pack 草稿' })
+  expect(button).toBeDisabled()
+  await userEvent.click(button)
+  expect(generate).not.toHaveBeenCalled()
+  expect(screen.getByRole('alert')).toHaveTextContent('fetch · /executor/timeoutMs')
 })

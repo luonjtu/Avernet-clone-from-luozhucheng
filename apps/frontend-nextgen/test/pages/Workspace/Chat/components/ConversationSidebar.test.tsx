@@ -257,12 +257,12 @@ describe('ConversationSidebar', () => {
   it('writes origin and scope changes to the store through the sync setters', () => {
     // 页面(任务 8)会订阅 Store 并把新快照传回;此处用 rerender 模拟同一契约。
     const { rerender } = render(<ConversationSidebar {...sidebarProps()} />);
-    fireEvent.click(screen.getByRole('button', { name: '发起归属与会话范围' }));
+    fireEvent.click(screen.getByRole('button', { name: '发起人与会话筛选' }));
     fireEvent.click(screen.getByRole('button', { name: '他人发起' }));
     expect(useConversationStore.getState().originByManagedBotId['bot-a:2088']).toBe('others');
 
     rerender(<ConversationSidebar {...sidebarProps()} />);
-    fireEvent.click(screen.getByRole('button', { name: '发起归属与会话范围' }));
+    fireEvent.click(screen.getByRole('button', { name: '发起人与会话筛选' }));
     // 管理/好友两行弹层常驻挂载同名「已收藏」按钮:按 DOM 序取管理行(先渲染)。
     fireEvent.click(screen.getAllByRole('button', { name: '已收藏' })[0]);
     expect(useConversationStore.getState().scopeByManagedBotId['bot-a:2088']).toBe('favorite');
@@ -270,9 +270,9 @@ describe('ConversationSidebar', () => {
 
   it('renders the origin filter on managed rows and the scope-only filter on friend rows', () => {
     render(<ConversationSidebar {...sidebarProps()} />);
-    // 管理 Bot 行:「发起归属与会话范围」(发起人 + 会话);好友 Bot 行:仅「会话」范围(无发起人)。
-    expect(screen.getAllByRole('button', { name: '发起归属与会话范围' })).toHaveLength(1);
-    expect(screen.getByRole('button', { name: '会话范围' })).toBeInTheDocument();
+    // 管理 Bot 行:「发起人与会话筛选」(发起人 + 会话);好友 Bot 行:仅「会话」筛选(无发起人)。
+    expect(screen.getAllByRole('button', { name: '发起人与会话筛选' })).toHaveLength(1);
+    expect(screen.getByRole('button', { name: '会话筛选' })).toBeInTheDocument();
     expect(screen.getByText('发起人')).toBeInTheDocument();
     // 管理/好友两行弹层常驻挂载,各带一份「已收藏」选项。
     expect(screen.getAllByRole('button', { name: '已收藏' })).toHaveLength(2);
@@ -358,8 +358,9 @@ describe('ConversationSidebar', () => {
     expect(directory.retryManaged).toHaveBeenCalledTimes(1);
   });
 
-  it('shows empty managed and friend states with the public Bots action', () => {
+  it('shows empty managed and friend states with inline route links', () => {
     const onOpenPublicBots = jest.fn();
+    const onOpenBotWorkshop = jest.fn();
     render(
       <ConversationSidebar
         {...sidebarProps({
@@ -367,41 +368,29 @@ describe('ConversationSidebar', () => {
           friendBots: [],
           directory: directoryModel({ managedBots: [], friendBots: [] }),
           onOpenPublicBots,
+          onOpenBotWorkshop,
         })}
       />,
     );
     expect(screen.getByText('暂无管理的 Bot')).toBeInTheDocument();
     expect(screen.getByText('暂无好友 Bot')).toBeInTheDocument();
-    fireEvent.click(screen.getAllByRole('button', { name: '前往公开 Bot' })[0]);
+    // 我的 Bot 空态引导去 Bot 管理创建(2026-10-14 体验修复);好友 Bot 空态引导去公开 Bot 发现。
+    fireEvent.click(screen.getByRole('button', { name: '「Bot 管理」' }));
+    expect(onOpenBotWorkshop).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: '「公开 Bot」' }));
     expect(onOpenPublicBots).toHaveBeenCalledTimes(1);
   });
 
-  it('routes the 我的/好友 Bot group add buttons to the Bot workshop page', () => {
-    const onOpenBotWorkshop = jest.fn();
-    render(<ConversationSidebar {...sidebarProps({ onOpenBotWorkshop })} />);
-    // 「+」添加入口统一跳 Bot 管理页,不再落到公开发现页。
-    const addButtons = screen.getAllByRole('button', { name: '添加 Bot' });
-    expect(addButtons).toHaveLength(2);
-    addButtons.forEach((button) => fireEvent.click(button));
-    expect(onOpenBotWorkshop).toHaveBeenCalledTimes(2);
-  });
-
-  it('routes the 团队 Bot group add button to the Bot workshop page too', () => {
-    const onOpenBotWorkshop = jest.fn();
+  it('不再渲染分组标题行的「+」添加入口', () => {
     render(
       <ConversationSidebar
         {...sidebarProps({
           teamBots: [teamBot],
           directory: directoryModel({ teamBots: [teamBot] }),
-          onOpenBotWorkshop,
         })}
       />,
     );
-    // 团队分组此前未接跳转回调(「+」无响应);现在同样跳 Bot 管理页。
-    const addButtons = screen.getAllByRole('button', { name: '添加 Bot' });
-    expect(addButtons).toHaveLength(3);
-    fireEvent.click(addButtons[1]);
-    expect(onOpenBotWorkshop).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: '添加 Bot' })).not.toBeInTheDocument();
   });
 
   it('renders read-only others sessions without interactive actions and opens via onOpenSession', () => {
@@ -866,7 +855,7 @@ it.each(['managed', 'team', 'friend'] as const)('hides TEClaw favorites and scop
   expect(screen.queryByText('全部')).not.toBeInTheDocument();
   expect(screen.queryByText('已收藏')).not.toBeInTheDocument();
   if (section !== 'friend') {
-    fireEvent.click(screen.getByRole('button', { name: '发起归属' }));
+    fireEvent.click(screen.getByRole('button', { name: '发起人筛选' }));
   }
   expect(Boolean(screen.queryByRole('button', { name: '我发起' }))).toBe(section !== 'friend');
   expect(Boolean(screen.queryByRole('button', { name: '他人发起' }))).toBe(section !== 'friend');
@@ -948,11 +937,23 @@ it('团队 settle 后空桶不渲染死分组;独立加载失败展示并可单�
   expect(retry).toHaveBeenCalledTimes(1);
 });
 
+it('搜索中团队组无匹配时同样隐藏空分组', () => {
+  render(
+    <ConversationSidebar
+      {...sidebarProps({ teamBots: [teamBot], directory: directoryModel({ teamBots: [teamBot] }) })}
+    />,
+  );
+  expect(screen.getByRole('group', { name: '团队 Bot' })).toBeInTheDocument();
+  // 关键字只命中我的 Bot,团队组过滤为空:空分组连同标题一并隐藏(2026-10-14 体验修复)。
+  fireEvent.change(screen.getByRole('textbox', { name: '搜索 Bot' }), { target: { value: '管理' } });
+  expect(screen.queryByRole('group', { name: '团队 Bot' })).not.toBeInTheDocument();
+});
+
 it('仅团队筛选禁用他人来源，管理 Bot 保持原有可用项', () => {
   const team: ConversationBotView = { ...botOf('team:entity', '团队 Bot'), section: 'team' };
   render(<ConversationSidebar {...sidebarProps({ teamBots: [team] })} />);
   const teamGroup = screen.getByRole('group', { name: '团队 Bot' });
-  fireEvent.click(within(teamGroup).getByRole('button', { name: '发起归属与会话范围' }));
+  fireEvent.click(within(teamGroup).getByRole('button', { name: '发起人与会话筛选' }));
   // 气泡内容常驻挂载(forceMount),管理/团队两行弹层都在 document 上,两侧选项同名
   // 「他人发起」,以禁用态区分:团队侧禁用、管理侧可用。点击禁用项不写入 Store。
   const othersOptions = screen

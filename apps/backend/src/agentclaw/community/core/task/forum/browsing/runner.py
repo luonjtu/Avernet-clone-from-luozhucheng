@@ -12,14 +12,12 @@ Heavy Bot transport is delegated to the existing ``OpenApiBotPort`` (bound by
 
 from __future__ import annotations
 
-import os
 from typing import Any, Literal
 
 from injector import inject
 
 from agentclaw.community.core.errors import NotFound, ValidationError
 from agentclaw.community.core.task.forum.browsing.messages import (
-    bbs_skill_install_message,
     browse_once_message,
     cron_event_message,
 )
@@ -33,23 +31,11 @@ from agentclaw.community.core.task.task_runner.client.ports import (
     BotSendResult,
     OpenApiBotPort,
 )
-from agentclaw.community.di.profile import DeployProfile
 from agentclaw.community.log import get_logger
 
 logger = get_logger()
 
-_DEFAULT_BACKEND_URL = "http://localhost:8888"
 PushAction = Literal["framework", "openclaw"]
-
-
-def _resolve_backend_url() -> str:
-    """Env-aware self URL (``BACKEND_URL`` > ``SINGLEBOX_BACKEND_URL`` > local)."""
-    url = os.environ.get("BACKEND_URL")
-    if url:
-        return url
-    if os.environ.get("DEPLOY_PROFILE", "").strip().lower() == DeployProfile.SINGLEBOX.value:
-        return os.environ.get("SINGLEBOX_BACKEND_URL", _DEFAULT_BACKEND_URL)
-    return _DEFAULT_BACKEND_URL
 
 
 class BbsBrowseLoopRunner:
@@ -60,9 +46,12 @@ class BbsBrowseLoopRunner:
         self,
         bot: OpenApiBotPort,
         service: ForumServiceProtocol,
+        *,
+        backend_url: str,
     ) -> None:
         self._bot = bot
         self._service = service
+        self._backend_url = backend_url.rstrip("/")
 
     async def push_browse_once(
         self,
@@ -86,15 +75,14 @@ class BbsBrowseLoopRunner:
                 f"trigger mode mismatch: subscription.mode={subscription.mode} "
                 f"but trigger expects {expected_mode}"
             )
-        backend_url = _resolve_backend_url()
         text = browse_once_message(
             bot_id=bot_id,
-            backend_base_url=backend_url,
+            backend_base_url=self._backend_url,
             subscription=subscription,
         )
         logger.info(
             "[bbs-browse-loop] push_browse_once bot=%s mode=%s backend=%s",
-            bot_id, subscription.mode, backend_url,
+            bot_id, subscription.mode, self._backend_url,
         )
         return await self._send(
             bot_id=bot_id,
@@ -157,35 +145,6 @@ class BbsBrowseLoopRunner:
         if action is not None:
             out["action"] = action
         return out
-
-    async def push_install_bbs_skills(self, *, bot_id: str) -> dict[str, Any] | None:
-        """Fire-and-forget: ask the Bot to make bbs-browse + bbs-topic-handler
-        OpenClaw skills available by self-symlinking them into
-        ``workspace/skills/`` from ``skills-pool/skills-repo/infra/``.
-
-        Independent of cron registration (which goes through the cron relay
-        API, not this channel): this is the join-time fix for "the Bot never
-        loaded bbs-browse". Best-effort like ``ensure_cron`` — never breaks a
-        join; the Bot's own install outcome is observed out of band.
-        """
-        text = bbs_skill_install_message(bot_id=bot_id)
-        logger.info("[bbs-browse-loop] install_skills bot=%s", bot_id)
-        try:
-            return await self._send(
-                bot_id=bot_id,
-                text=text,
-                metadata={
-                    "biz_module": "bbs_browse_loop",
-                    "action": "install_skills",
-                },
-                mode=BROWSE_MODE_OPENCLAW,
-                action="install_skills",
-            )
-        except Exception as exc:  # noqa: BLE001 — never let skill install break a join
-            logger.warning(
-                "[bbs-browse-loop] install_skills failed bot=%s: %s", bot_id, exc,
-            )
-            return None
 
     def _lookup(self, bot_id: str) -> BrowseSubscriptionRecord:
         sub = self._service.get_subscription(bot_id=bot_id)

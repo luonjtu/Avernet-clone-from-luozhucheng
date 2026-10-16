@@ -130,6 +130,68 @@ async fn plugin_registration_generates_a_provider_bot_ref_when_none_is_given() {
     assert_eq!(document["plugin"]["url"].as_str(), Some("ws://127.0.0.1:21000/ws/bot"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn desktop_registration_persists_socket_and_rejects_invalid_options_before_network() {
+    let home = tempfile::tempdir().unwrap();
+    let api = Api::new().await;
+    let directory = home.path().join("app-server-control");
+    std::fs::create_dir(&directory).unwrap();
+    let socket = directory.join("app-server-control.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let peer = tokio::spawn(async move {
+        use futures::{SinkExt, StreamExt};
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "initialize");
+            ws.send(json!({"id":request["id"],"result":{"userAgent":"codex/test"}}).to_string().into()).await.unwrap();
+            while let Some(frame) = ws.next().await {
+                let frame = frame.unwrap();
+                if frame.is_close() { break; }
+                let value: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                assert_eq!(value["method"], "initialized");
+            }
+        }
+    });
+    let option = format!("socket={}", socket.display());
+    let output = register(home.path(), &["--mode", "plugin", "--api-url", &api.base,
+        "--upstream-url", "ws://127.0.0.1:21000/ws/bot", "--engine", "codex-desktop",
+        "--engine-option", &option])
+        .output().await.unwrap();
+    assert!(output.status.success(), "{}", diagnostic(&output));
+    let document = saved(home.path());
+    assert_eq!(document["bot"][0]["engine"].as_str(), Some("codex-desktop"));
+    assert_eq!(document["bot"][0]["engine_options"]["socket"].as_str(), socket.to_str());
+    for option in ["socket=relative.sock", "socket=/tmp/a", "unknown=value", "missing-separator"] {
+        let other = tempfile::tempdir().unwrap();
+        let args = if option == "socket=/tmp/a" {
+            vec!["--engine-option", option, "--engine-option", option]
+        } else { vec!["--engine-option", option] };
+        let output = register(other.path(), &["--mode", "plugin", "--api-url", &api.base,
+            "--upstream-url", "ws://127.0.0.1:21000/ws/bot", "--engine", "codex-desktop"])
+            .args(args).output().await.unwrap();
+        assert!(!output.status.success(), "{option}");
+        assert!(!config_path(other.path()).exists());
+    }
+    let automatic = tempfile::tempdir().unwrap();
+    let output = register(automatic.path(), &["--mode", "plugin", "--api-url", &api.base,
+        "--upstream-url", "ws://127.0.0.1:21000/ws/bot", "--engine", "codex-desktop"])
+        .env("CODEX_HOME", home.path()).env("PATH", "").output().await.unwrap();
+    assert!(output.status.success(), "{}", diagnostic(&output));
+    assert!(saved(automatic.path())["bot"][0].get("engine_options").is_none());
+    peer.await.unwrap();
+    let absent = tempfile::tempdir().unwrap();
+    let output = register(absent.path(), &["--mode", "plugin", "--api-url", &api.base,
+        "--upstream-url", "ws://127.0.0.1:21000/ws/bot", "--engine", "codex-desktop"])
+        .env("CODEX_HOME", absent.path()).output().await.unwrap();
+    assert!(!output.status.success());
+    assert!(diagnostic(&output).contains("desktop detection failed"));
+    assert!(!config_path(absent.path()).exists());
+    assert_eq!(api.calls().len(), 2);
+}
+
 #[tokio::test]
 async fn missing_explicit_inputs_are_rejected_before_registration() {
     let api = Api::new().await;
@@ -468,7 +530,7 @@ async fn gateway_local_replacement_retains_omitted_webhook_without_admin_or_regi
 }
 
 #[tokio::test]
-async fn stopped_qwen_profiles_keep_desktop_hooks_and_conflicting_settings_block_registration() {
+async fn stopped_qwen_profiles_reuse_shared_desktop_settings_and_reject_ambiguous_legacy_settings() {
     let home = tempfile::tempdir().unwrap();
     let old_api = Api::new().await;
     let args = ["--mode", "plugin", "--engine", "qwenwork", "--upstream-url", "ws://127.0.0.1:21000/ws/bot"];
@@ -508,10 +570,15 @@ async fn stopped_qwen_profiles_keep_desktop_hooks_and_conflicting_settings_block
     let mut conflict = old.clone();
     conflict["bot"][0]["engine_options"]["hook_secret"] = "different-hook-secret".into();
     std::fs::write(directory.join("qwenwork.toml"), toml::to_string(&conflict).unwrap()).unwrap();
-    let rejected = register(home.path(), &args).args(["--profile", "other", "--api-url", &prod_api.base]).output().await.unwrap();
+    let migrated = register(home.path(), &args).args(["--profile", "other", "--api-url", &prod_api.base]).output().await.unwrap();
+    assert!(migrated.status.success(), "{}", diagnostic(&migrated));
+    let other: toml::Value = toml::from_str(&std::fs::read_to_string(directory.join("profiles/other/bridge.toml")).unwrap()).unwrap();
+    assert_eq!(other["bot"][0]["engine_options"], old["bot"][0]["engine_options"]);
+    std::fs::remove_file(settings.with_file_name("bcs-bridge.toml")).unwrap();
+    let rejected = register(home.path(), &args).args(["--profile", "ambiguous", "--api-url", &prod_api.base]).output().await.unwrap();
     assert!(!rejected.status.success());
     assert!(diagnostic(&rejected).contains("conflicting desktop settings"));
-    assert_eq!(prod_api.calls().len(), 1);
-    assert!(!directory.join("profiles/other/bridge.toml").exists());
+    assert_eq!(prod_api.calls().len(), 2);
+    assert!(!directory.join("profiles/ambiguous/bridge.toml").exists());
     assert_eq!(std::fs::read(&settings).unwrap(), hooks);
 }

@@ -15,6 +15,10 @@ use anyhow::{Context, bail};
 use clap::Args;
 
 pub use client::RegistrationClient;
+
+/// Registration route and success format selected by the distribution.
+#[derive(Clone, Copy, Default)]
+pub enum RegistrationApi { #[default] OpenApi, Root }
 pub use token::{Mode, registration_provider};
 
 use crate::app::BridgeApp;
@@ -74,6 +78,9 @@ pub struct RegisterArgs {
     /// Override the engine executable (default: the engine's executable on PATH)
     #[arg(long)]
     engine_bin: Option<PathBuf>,
+    /// String engine option, e.g. socket=/absolute/path (repeatable)
+    #[arg(long, value_name = "NAME=VALUE")]
+    engine_option: Vec<String>,
 }
 
 impl RegisterArgs {
@@ -174,6 +181,20 @@ pub async fn register(args: RegisterArgs, path: &Path, app: &BridgeApp) -> anyho
         if args.engine_bin.is_some() { bail!("--engine-bin does not apply to engine '{}'", args.engine); }
         None
     };
+    let mut engine_options = toml::Table::new();
+    for option in &args.engine_option {
+        let (name, value) = option.split_once('=')
+            .filter(|(name, _)| !name.trim().is_empty())
+            .context("--engine-option requires NAME=VALUE")?;
+        if engine_options.insert(name.to_owned(), value.into()).is_some() {
+            bail!("Duplicate --engine-option name");
+        }
+    }
+    if !engine_options.is_empty() || factory.registration_requires_options() {
+        let engine = factory.build(engine_bin.clone().unwrap_or_default(), &engine_options)
+            .map_err(|error| anyhow::anyhow!("Invalid engine options: {error}"))?;
+        engine.preflight().await?;
+    }
     if args.token.trim().is_empty() || args.bot_name.trim().is_empty() { bail!("Registration token and Bot name must be nonempty"); }
     if args.provider_bot_ref.as_deref().is_some_and(|value| !valid_provider_bot_ref(value)) {
         bail!("--provider-bot-ref must be 1-128 characters of letters, digits, '_', '.', ':' or '-'");
@@ -219,10 +240,15 @@ pub async fn register(args: RegisterArgs, path: &Path, app: &BridgeApp) -> anyho
         Mode::Plugin => None,
     };
     let client = RegistrationClient::new(&api_url).context("Invalid registration.api_url or HTTP client configuration")?;
+    let client = match app.registration_api() {
+        RegistrationApi::OpenApi => client,
+        RegistrationApi::Root => client.with_legacy_registration(),
+    };
     if replacement::update(&args, path, &bootstrap, &provider_id, &api_url, &client, webhook_token.as_deref(), engine_bin.as_deref()).await? { return Ok(()); }
     let mut bot = toml::Table::new();
     bot.insert("provider_bot_ref".into(), "pending-identity".into());
     bot.insert("engine".into(), args.engine.clone().into());
+    if !engine_options.is_empty() { bot.insert("engine_options".into(), engine_options.into()); }
     bot.insert("cwd".into(), cwd.to_str().context("Engine working directory must be UTF-8")?.into());
     if let Some(model) = args.model { bot.insert("model".into(), model.into()); }
     if let Some(mode) = app.registration_permission_mode(&args.engine) {
@@ -288,7 +314,7 @@ pub async fn register(args: RegisterArgs, path: &Path, app: &BridgeApp) -> anyho
     document.insert("bot".into(), toml::Value::Array(vec![toml::Value::Table(bot)]));
     config::runtime(&document, path, webhook_token.as_deref())?;
     // Persist the resolved api_url so the saved configuration is self-contained.
-    let resolved = config::RegistrationSettings { api_url: Some(api_url), webhook_url: webhook_url.map(str::to_owned) };
+    let resolved = config::RegistrationSettings { api_url: Some(api_url), webhook_url: webhook_url.map(str::to_owned), provider_auth: Some(identity.runtime_auth().to_owned()) };
     document.insert("registration".into(), toml::Value::try_from(resolved).context("Cannot encode API settings")?);
     let text = toml::to_string_pretty(&document).context("Cannot encode registered bridge configuration")?;
     prepared.save(&text)?;

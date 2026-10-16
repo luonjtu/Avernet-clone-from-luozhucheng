@@ -168,6 +168,20 @@ from agentclaw.community.core.cron.errors import (
     CronApiTimeoutError,
     CronRelayError,
 )
+from agentclaw.community.api.acli_cli_service import (
+    AcliBotNotRunningError,
+    AcliCliAlreadyGrantedError,
+    AcliCliNameMismatchError,
+    AcliCliNotGrantedError,
+    AcliDefaultCliError,
+    AcliEngineUnsupportedError,
+    AcliGrantSyncError,
+    AcliMarketNotConfiguredError,
+    AcliMarketUnavailableError,
+    AcliOperationFailedError,
+    AcliRequestRejectedError,
+    AcliRollbackFailedError,
+)
 from agentclaw.community.core.caller_identity.contracts import (
     CallerCallTypeInvalidError,
     CallerIdentityAmbiguousError,
@@ -274,6 +288,7 @@ from agentclaw.community.core.errors import (
     CallbackCorrelationError,
 )
 from agentclaw.community.core.task.domain.errors import (
+    DispatchInProgress,
     GraphAlreadyInitializedError,
     GraphIntegrityError,
     NodeNotFoundError,
@@ -372,6 +387,18 @@ ENVELOPE_ERRORS: dict[type[Exception], tuple[int, str]] = {
     CallerMcpNotFoundError: (404, "Not found"),
     CallerMcpSyncError: (502, "Caller identity synchronization failed"),
     CallerCallTypeInvalidError: (500, "Internal error"),
+    AcliCliAlreadyGrantedError: (409, "CLI is already granted to this bot"),
+    AcliCliNotGrantedError: (404, "Not found"),
+    AcliDefaultCliError: (409, "Default CLIs cannot be removed"),
+    AcliCliNameMismatchError: (422, "Use the tool's acli market name"),
+    AcliEngineUnsupportedError: (501, "This bot's engine does not support acli CLIs"),
+    AcliBotNotRunningError: (409, "The bot has no running container"),
+    AcliRequestRejectedError: (422, "acli rejected the request"),
+    AcliOperationFailedError: (502, "The acli operation failed"),
+    AcliGrantSyncError: (502, "The CLI grant could not be synchronized"),
+    AcliMarketNotConfiguredError: (501, "The acli market is not configured"),
+    AcliMarketUnavailableError: (502, "The acli market is unavailable"),
+    AcliRollbackFailedError: (500, "The change could not be rolled back"),
     MissingPrincipalError: (401, "Unauthorized"),
     # Byte-identical to the line above, deliberately. "You sent no principal" and
     # "your principal did not verify" must be indistinguishable, or the response
@@ -766,6 +793,9 @@ ENVELOPE_ERRORS: dict[type[Exception], tuple[int, str]] = {
     GraphAlreadyInitializedError: (409, "Task graph already exists"),
     GraphIntegrityError: (409, "Graph integrity violated"),
     TaskStateError: (409, "Illegal state transition"),
+    # S6 concurrent dispatch contract: mapped before ``TaskError`` and given a
+    # Retry-After hint by mapped_error_response.
+    DispatchInProgress: (409, "Dispatch in progress"),
     CallbackAuthError: (401, "Unauthorized"),
     CallbackCorrelationError: (400, "Bad request"),
     # Trajectory analysis (REQ-8 / 决策 #10/#14). Two distinct statuses, two
@@ -896,6 +926,13 @@ def mapped_error_response(exc: Exception, request: Request) -> JSONResponse | No
     Returns on the first ``isinstance`` match in insertion order, so a specific
     leaf listed before its base class still wins.
     """
+    if isinstance(exc, DispatchInProgress):
+        return error_response_for(
+            409,
+            "Dispatch in progress",
+            request,
+            headers={"Retry-After": "10"},
+        )
     if isinstance(exc, SkillSetControlPlaneConflictError):
         code, message = _SKILL_SET_CONFLICT_CODES.get(
             str(exc), (409000, "SkillSet state conflicts with this operation")

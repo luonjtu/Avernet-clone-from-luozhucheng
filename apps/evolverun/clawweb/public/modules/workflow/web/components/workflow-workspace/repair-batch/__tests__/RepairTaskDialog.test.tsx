@@ -2,6 +2,7 @@ import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RepairTaskDetail } from '../../../../../server/contracts/repair-workbench'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 const repairApi = vi.hoisted(() => ({
   task: vi.fn(),
@@ -12,6 +13,7 @@ const repairApi = vi.hoisted(() => ({
   cancel: vi.fn(),
   revise: vi.fn(),
   diff: vi.fn(),
+  verification: vi.fn(),
 }))
 vi.mock('../../../../api/repair-batches', () => ({ repairBatches: repairApi }))
 
@@ -58,8 +60,84 @@ const candidates = () => ({
   page: { page: 1, pageSize: 20, total: 1, totalPages: 1 }, limits: { maxItems: 100, maxRequestBytes: 65536 },
 })
 
+it('shows one primary action, durable failed deployment status and Git links instead of prominent hashes', async () => {
+  const detail = taskDetail('review', '候选已生成')
+  detail.capabilities.publication = true
+  detail.release = { repositoryWebUrl: 'https://example.com/workflows/packs',
+    approval: { id: 'approved', revision: 1, status: 'approved', target: { id: 'prod', environment: 'prod', label: '生产 Bot' } },
+    deployments: [{ id: 'failed', approvalId: 'approved', revision: 1, status: 'failed', error: '发布入口不存在' }] } as never
+  repairApi.task.mockResolvedValue(detail)
+  render(<RepairTaskDialog workflowId="wf-1" taskId="FIX-1" includeHistorical={false} canEdit onClose={() => {}} onChanged={() => {}} />)
+  expect(await screen.findByRole('button', { name: '发布此版本' })).toBeEnabled()
+  expect(screen.getAllByLabelText('当前修复步骤与下一步')).toHaveLength(1)
+  expect(screen.queryByRole('button', { name: '进入候选确认' })).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /v1 · 部署失败/ })).toBeInTheDocument()
+  expect(screen.getByRole('link', { name: /查看 Git 提交/ })).toHaveAttribute('href', `https://example.com/workflows/packs/commit/${'d'.repeat(40)}`)
+  expect(screen.getByText('d'.repeat(40))).not.toBeVisible()
+})
+
 beforeEach(() => { Object.values(repairApi).forEach(mock => mock.mockReset()); repairApi.diff.mockResolvedValue({ files: [], truncated: false }) })
 afterEach(() => vi.useRealTimers())
+
+it('shows the selected historical failure and identifies the latest execution separately', async () => {
+  const detail = taskDetail('review', '最新成功候选')
+  detail.latestAttempt.revision = 6
+  const failed = { ...detail.latestAttempt, revision: 5, phase: 'failed', draft: null, checks: null,
+    error: { code: 'AIS_FAILED', message: 'Failed to submit task, Please resubmit!' } } as RepairTaskDetail['latestAttempt']
+  detail.revisions = [detail.latestAttempt, failed]
+  repairApi.task.mockResolvedValue(detail)
+  render(<RepairTaskDialog workflowId="wf-1" taskId="FIX-1" includeHistorical={false} canEdit={false} onClose={() => {}} onChanged={() => {}} />)
+  await userEvent.selectOptions(await screen.findByRole('combobox', { name: '查看修复版本' }), '5')
+  expect(screen.getByText('所选版本 v5：生成失败')).toBeVisible()
+  expect(screen.getByText(/最近 v6 的执行记录/)).toBeVisible()
+  expect(screen.getByText(/AIS 任务执行或提交失败/)).toBeVisible()
+  expect(screen.queryByText('当前查看的是历史候选，请切回最新可用候选。')).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: '发布此版本' })).not.toBeInTheDocument()
+})
+
+it('makes failure without any successful candidate a recovery state rather than a review target', async () => {
+  const detail = taskDetail('drafting')
+  detail.latestAttempt.phase = 'failed'; detail.latestAttempt.error = { code: 'AIS_FAILED', message: 'Failed to submit task' }
+  repairApi.task.mockResolvedValue(detail)
+  render(<RepairTaskDialog workflowId="wf-1" taskId="FIX-1" includeHistorical={false} canEdit onClose={() => {}} onChanged={() => {}} />)
+  expect(await screen.findByRole('heading', { name: '优化草稿生成失败，先恢复原任务' })).toBeVisible()
+  expect(screen.queryByText('当前查看的是历史候选，请切回最新可用候选。')).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: '发布此版本' })).not.toBeInTheDocument()
+})
+
+it('explains the latest no-change attempt without calling it historical or asking for publication', async () => {
+  const detail = taskDetail('review', '原候选')
+  const next = { ...detail.latestAttempt, revision: 2, phase: 'no_change', draft: { summary: '已有修改覆盖此建议' } } as RepairTaskDetail['latestAttempt']
+  detail.latestAttempt = next; detail.revisions = [next, detail.latestSuccessful!]
+  repairApi.task.mockResolvedValue(detail)
+  render(<RepairTaskDialog workflowId="wf-1" taskId="FIX-1" includeHistorical={false} canEdit={false} onClose={() => {}} onChanged={() => {}} />)
+  await userEvent.selectOptions(await screen.findByRole('combobox', { name: '查看修复版本' }), '2')
+  expect(screen.getByText('所选版本 v2：无需变更')).toBeVisible()
+  expect(screen.getByRole('heading', { name: '本轮无需重新发布' })).toBeVisible()
+  expect(screen.queryByText('当前查看的是历史候选，请切回最新可用候选。')).not.toBeInTheDocument()
+})
+
+it('lets a read-only user revisit a published scope and candidate without editing or publishing', async () => {
+  const detail = taskDetail('review', '已审阅的候选', ['item-1'])
+  detail.capabilities.publication = true
+  detail.release = { deployments: [{ id: 'deploy-1', revision: 1, status: 'succeeded', baselineDeployNumber: 157, receipt: { deployNumber: 160 } }] } as never
+  repairApi.task.mockResolvedValue(detail)
+  const scroll = vi.fn()
+  Element.prototype.scrollIntoView = scroll
+  repairApi.verification.mockResolvedValue({ evidence: null, conclusions: [] })
+  render(<QueryClientProvider client={new QueryClient()}><RepairTaskDialog workflowId="wf-1" taskId="FIX-1" includeHistorical={false} canEdit={false} onClose={() => {}} onChanged={() => {}} /></QueryClientProvider>)
+  await screen.findByText('候选 Pack · v1')
+  expect(screen.getByRole('link', { name: '查看版本对比' })).toHaveAttribute('href', '/workflows/workspace?workflowId=wf-1&tab=overview&view=version-comparison&baseline=157&current=160')
+  await userEvent.click(screen.getByRole('button', { name: '生成优化草稿', exact: true }))
+  expect(screen.getByRole('heading', { name: '本轮冻结范围' })).toBeVisible()
+  expect(screen.queryByRole('button', { name: '确认生成下一版' })).not.toBeInTheDocument()
+  await userEvent.click(screen.getByRole('button', { name: '审阅并确认发布', exact: true }))
+  expect(scroll.mock.instances.at(-1)).toBe(document.getElementById('repair-review-FIX-1'))
+  expect(repairApi.candidates).not.toHaveBeenCalled()
+  expect(repairApi.revise).not.toHaveBeenCalled()
+  expect(repairApi.retryDispatch).not.toHaveBeenCalled()
+  expect(screen.queryByRole('button', { name: '发布此版本' })).not.toBeInTheDocument()
+})
 
 describe('RepairTaskDialog', () => {
   it('refreshes a read-only failed task without invoking result recovery mutations', async () => {
@@ -67,7 +145,7 @@ describe('RepairTaskDialog', () => {
     failed.latestAttempt.phase = 'failed'; failed.latestAttempt.error = { code: 'GIT_RESULT_UNAVAILABLE' }
     repairApi.task.mockResolvedValue(failed); repairApi.candidates.mockResolvedValue(candidates())
     render(<RepairTaskDialog workflowId="wf-1" taskId="FIX-1" includeHistorical={false} canEdit={false} onClose={() => {}} onChanged={() => {}} />)
-    await userEvent.click(await screen.findByRole('button', { name: '选择建议', exact: true }))
+    await userEvent.click(await screen.findByRole('button', { name: '生成优化草稿', exact: true }))
     await screen.findByRole('checkbox', { name: '选择修订项 新出现的修复建议' })
     expect(screen.queryByRole('button', { name: '核对原结果', exact: true })).not.toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: '核对任务状态', exact: true }))
@@ -87,7 +165,7 @@ describe('RepairTaskDialog', () => {
       throw new Error('response lost')
     })
     render(<RepairTaskDialog workflowId="wf-1" taskId="FIX-1" includeHistorical={false} canEdit onClose={() => {}} onChanged={() => {}} />)
-    await userEvent.click(await screen.findByRole('button', { name: '选择建议', exact: true }))
+    await userEvent.click(await screen.findByRole('button', { name: '生成优化草稿', exact: true }))
     await screen.findByRole('checkbox', { name: '选择修订项 新出现的修复建议' })
     await userEvent.click(screen.getByRole('button', { name: '确认生成下一版' }))
     const recovery = await screen.findByRole('button', { name: '核对任务状态', exact: true })
@@ -106,7 +184,7 @@ describe('RepairTaskDialog', () => {
     repairApi.candidates.mockResolvedValue(candidates())
     repairApi.revise.mockRejectedValueOnce({ status: 409, body: JSON.stringify({ code: 'SOURCE_CHANGED' }) }).mockResolvedValue({})
     render(<RepairTaskDialog workflowId="wf-1" taskId="FIX-1" includeHistorical={false} canEdit onClose={() => {}} onChanged={() => {}} />)
-    await userEvent.click(await screen.findByRole('button', { name: '选择建议', exact: true }))
+    await userEvent.click(await screen.findByRole('button', { name: '生成优化草稿', exact: true }))
     await screen.findByRole('checkbox', { name: '选择修订项 新出现的修复建议' })
     await userEvent.type(screen.getByRole('textbox', { name: '修复要求' }), '保留原分支')
     await userEvent.type(screen.getByRole('textbox', { name: '修改反馈' }), '补充边界')
@@ -259,14 +337,14 @@ describe('RepairTaskDialog', () => {
     await waitFor(() => expect(repairApi.revise).toHaveBeenCalledTimes(1))
     const firstId = repairApi.revise.mock.calls[0][1].requestId
     await userEvent.click(screen.getByRole('button', { name: '核对任务状态', exact: true }))
-    await userEvent.click(screen.getByRole('button', { name: '选择建议', exact: true }))
+    await userEvent.click(screen.getByRole('button', { name: '生成优化草稿', exact: true }))
     await waitFor(() => expect(screen.getByRole('button', { name: '确认生成下一版' })).toBeEnabled())
     await userEvent.click(screen.getByRole('button', { name: '确认生成下一版' }))
     await waitFor(() => expect(repairApi.revise).toHaveBeenCalledTimes(2))
     expect(repairApi.revise.mock.calls[1][1].requestId).toBe(firstId)
 
     await userEvent.click(screen.getByRole('button', { name: '核对任务状态', exact: true }))
-    await userEvent.click(screen.getByRole('button', { name: '选择建议', exact: true }))
+    await userEvent.click(screen.getByRole('button', { name: '生成优化草稿', exact: true }))
     feedback = screen.getByRole('textbox', { name: '修改反馈' })
     await userEvent.type(feedback, '，调整范围')
     await userEvent.click(screen.getByRole('button', { name: '确认生成下一版' }))
@@ -305,17 +383,17 @@ describe('RepairTaskDialog', () => {
     repairApi.task.mockResolvedValue(taskDetail('review', '候选已生成', ['item-1', 'item-2']));
     repairApi.candidates.mockResolvedValue(candidates());
     render(<RepairTaskDialog workflowId="wf-1" taskId="FIX-1" includeHistorical={false} canEdit onClose={() => {}} onChanged={() => {}} />);
-    await userEvent.click(await screen.findByRole('button', { name: '选择建议', exact: true }));
+    await userEvent.click(await screen.findByRole('button', { name: '生成优化草稿', exact: true }));
     await screen.findByRole('checkbox', { name: '选择修订项 新出现的修复建议' });
     await userEvent.type(screen.getByRole('textbox', { name: '修复要求' }), '保留原分支');
     await userEvent.click(screen.getByRole('checkbox', { name: '选择修订项 修复建议 2' }));
-    await userEvent.click(screen.getByRole('button', { name: '审核 Pack', exact: true }));
+    await userEvent.click(screen.getByRole('button', { name: '审阅并确认发布', exact: true }));
     expect(screen.getByText('候选已生成')).toBeVisible();
-    await userEvent.click(screen.getByRole('button', { name: '选择建议', exact: true }));
+    await userEvent.click(screen.getByRole('button', { name: '生成优化草稿', exact: true }));
     expect(screen.getByRole('textbox', { name: '修复要求' })).toHaveValue('保留原分支');
     expect(screen.getByRole('checkbox', { name: '选择修订项 修复建议 2' })).not.toBeChecked();
-    expect(screen.getByRole('button', { name: '发布与灰度', exact: true })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '效果与复发', exact: true })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '审阅并确认发布', exact: true })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '自动验证', exact: true })).toBeDisabled();
     expect(repairApi.revise).not.toHaveBeenCalled();
   });
 
@@ -342,7 +420,7 @@ describe('RepairTaskDialog', () => {
     expect(repairApi.retryResult).toHaveBeenCalledWith('FIX-1', 1);
     expect(repairApi.retryGeneration).not.toHaveBeenCalled();
     expect(repairApi.revise).toHaveBeenCalledTimes(1);
-    await userEvent.click(screen.getByRole('button', { name: '选择建议', exact: true }));
+    await userEvent.click(screen.getByRole('button', { name: '生成优化草稿', exact: true }));
     expect(screen.getByRole('textbox', { name: '修复要求' })).toHaveValue('我的调整');
   });
 
@@ -350,7 +428,7 @@ describe('RepairTaskDialog', () => {
     repairApi.task.mockResolvedValue(taskDetail('review', '只读候选', ['item-1']));
     repairApi.candidates.mockResolvedValue(candidates());
     render(<RepairTaskDialog workflowId="wf-1" taskId="FIX-1" includeHistorical={false} canEdit={false} onClose={() => {}} onChanged={() => {}} />);
-    await userEvent.click(await screen.findByRole('button', { name: '选择建议', exact: true }));
+    await userEvent.click(await screen.findByRole('button', { name: '生成优化草稿', exact: true }));
     await screen.findByRole('checkbox', { name: '选择修订项 新出现的修复建议' });
     expect(screen.getByRole('button', { name: '确认生成下一版' })).toBeDisabled();
     expect(screen.getByText('当前只有查看权限，不能生成候选。')).toBeVisible();
@@ -362,10 +440,25 @@ describe('RepairTaskDialog', () => {
     failed.latestAttempt.phase = 'failed'; failed.latestAttempt.error = { code: 'GIT_RESULT_UNAVAILABLE' };
     repairApi.task.mockResolvedValue(failed); repairApi.candidates.mockResolvedValue(candidates());
     render(<RepairTaskDialog workflowId="wf-1" taskId="FIX-1" includeHistorical={false} canEdit onClose={() => {}} onChanged={() => {}} />);
-    await userEvent.click(await screen.findByRole('button', { name: '选择建议', exact: true }));
+    await userEvent.click(await screen.findByRole('button', { name: '生成优化草稿', exact: true }));
     await screen.findByRole('checkbox', { name: '选择修订项 新出现的修复建议' });
     expect(screen.getByRole('button', { name: '确认生成下一版' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '核对原结果', exact: true })).toBeEnabled();
   });
 
 })
+
+it('pages older candidate history while preserving the full current attempt and round scope', async () => {
+  const user = userEvent.setup();
+  const first = { ...taskDetail('review', '最新候选', ['last-batch-item']), scopeItemCount: 225,
+    automaticProgress: { completedBatches: 3, totalBatches: 3 }, revisionPage: { page: 1, pageSize: 20, total: 25, totalPages: 2 } };
+  const old = { ...first.latestAttempt, revision: 0, draft: null };
+  const second = { ...first, revisions: [old], revisionPage: { ...first.revisionPage, page: 2 } };
+  repairApi.task.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+  repairApi.diff.mockResolvedValue({ files: [], truncated: false });
+  render(<RepairTaskDialog workflowId="wf-1" taskId="FIX-1" includeHistorical={false} canEdit onClose={vi.fn()} onChanged={vi.fn()} />);
+  expect(await screen.findByText(/本轮已纳入 225 项/)).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: '较早记录' }));
+  await waitFor(() => expect(repairApi.task).toHaveBeenLastCalledWith('FIX-1', 2));
+  expect(await screen.findByText('历史记录第 2/2 页 · 共 25 次')).toBeInTheDocument();
+});

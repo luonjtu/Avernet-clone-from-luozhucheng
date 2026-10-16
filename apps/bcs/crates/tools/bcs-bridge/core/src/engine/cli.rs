@@ -15,6 +15,7 @@ pub struct CliSession {
     /// child is unreaped (even as a zombie) the kernel cannot recycle its
     /// pid, so the group address still belongs to this session's tree only.
     reaped: bool,
+    stdout_buffer: Vec<u8>,
 }
 
 impl CliSession {
@@ -80,8 +81,12 @@ impl CliSession {
             stdout: BufReader::new(stdout),
             trace,
             reaped: false,
+            stdout_buffer: Vec::new(),
         })
     }
+
+    /// A multiplexed process traces stdout after assigning messages to runs.
+    pub(super) fn disable_raw_trace(&mut self) { self.trace = None; }
 
     pub async fn write_line(&mut self, line: &str) -> std::io::Result<()> {
         let stdin = self
@@ -104,11 +109,12 @@ impl CliSession {
     }
 
     pub async fn next_line(&mut self) -> std::io::Result<Option<String>> {
-        let mut line = String::new();
-        let n = self.stdout.read_line(&mut line).await?;
-        if n == 0 {
+        let n = self.stdout.read_until(b'\n', &mut self.stdout_buffer).await?;
+        if n == 0 && self.stdout_buffer.is_empty() {
             return Ok(None);
         }
+        let line = String::from_utf8(std::mem::take(&mut self.stdout_buffer))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         if let Some(trace) = &self.trace {
             trace.record_raw(line.trim_end_matches(['\n', '\r']));
         }
@@ -120,6 +126,10 @@ impl CliSession {
     /// contains this session's tree, so the negative-pid signal cannot reach
     /// unrelated processes. Falls back to killing the direct child alone when
     /// group signaling fails (e.g. non-unix, or the group is already gone).
+    ///
+    /// Callers that can `.await` should prefer `graceful_kill_process_group`,
+    /// which SIGTERMs first and gives the CLI a bounded window to flush
+    /// undelivered queue notifications before this hard kill.
     #[allow(unsafe_code)]
     fn kill_process_group(&mut self) {
         if self.reaped {
@@ -137,8 +147,42 @@ impl CliSession {
         }
     }
 
-    pub async fn kill(&mut self) {
+    /// Graceful teardown: close stdin first, SIGTERM the whole process group,
+    /// wait up to `GRACE_WINDOW` for the group to empty, only then SIGKILL.
+    /// This lets the CLI flush undelivered task notifications out of its
+    /// internal queue before dying — same-sequence kills without this window
+    /// freeze those notifications in the transcript and crash resume-of-turn
+    /// after resume (observed in production).
+    #[allow(unsafe_code)]
+    async fn graceful_kill_process_group(&mut self) {
+        if self.reaped {
+            return;
+        }
+        // 1. Close stdin — signals the CLI there will be no more input and it
+        //    can begin its shutdown path.
+        self.close_stdin();
+        // 2. SIGTERM the group (catchable — the CLI can flush queues).
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id().filter(|pid| *pid > 0) {
+            let pgid = pid as libc::pid_t;
+            let _ = unsafe { libc::kill(-pgid, libc::SIGTERM) };
+        }
+        // 3. Wait for the group to empty. `receiver_count()==0` on the child
+        //    means the leader exited; background-task descendants (node
+        //    workers) may still linger — a short bounded sleep covers them.
+        let deadline = std::time::Instant::now() + GRACE_WINDOW;
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // 4. Whatever's left gets SIGKILL.
         self.kill_process_group();
+    }
+
+    pub async fn kill(&mut self) {
+        self.graceful_kill_process_group().await;
         let _ = self.child.wait().await;
         self.reaped = true;
     }
@@ -149,12 +193,39 @@ impl Drop for CliSession {
     /// engine's result line and drops the session), so it must reap the whole
     /// tree too — a single-child kill_on_drop orphans every descendant, which
     /// is how orphaned engine/claude/MCP trees accumulated until the host
-    /// OOM'd. `kill_on_drop` stays enabled as a belt-and-braces fallback for
-    /// the direct child.
+    /// OOM'd. The graceful sequence runs synchronously here (can't `.await`):
+    /// close stdin → SIGTERM group → short bounded spin → SIGKILL. The spin
+    /// is proportional to what's still alive — a CLI that exits on SIGTERM
+    /// in 50ms spends 50ms here, not the full 2 s.
+    ///
+    /// `kill_on_drop` stays enabled as a belt-and-braces fallback: it covers
+    /// the direct child if anything in this synchronous path panics.
+    #[allow(unsafe_code)]
     fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        self.close_stdin();
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id().filter(|pid| *pid > 0) {
+            let pgid = pid as libc::pid_t;
+            let _ = unsafe { libc::kill(-pgid, libc::SIGTERM) };
+            let deadline = std::time::Instant::now() + GRACE_WINDOW;
+            while std::time::Instant::now() < deadline {
+                if let Ok(Some(_)) = self.child.try_wait() {
+                    break; // leader exited — SIGKILL below sweeps the rest.
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
         self.kill_process_group();
     }
 }
+
+/// Graceful-kill window: how long the CLI gets between SIGTERM and SIGKILL
+/// to flush internal queues (undelivered task notifications) and exit.
+/// Same order multica uses for its engine teardown.
+const GRACE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Give the engine stdout pipe enough room for a complete JSONL event.
 ///
@@ -226,6 +297,18 @@ mod tests {
         cli.write_line("hello").await.unwrap();
         let line = cli.next_line().await.unwrap().unwrap();
         assert_eq!(line, "ack:hello");
+        cli.kill().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_preserves_partial_stdout_line() {
+        let mut cli = CliSession::spawn(
+            Path::new("bash"),
+            &["-c".into(), "printf prefix; sleep 0.15; printf 'suffix\\n'; sleep 1".into()],
+            Path::new("."), &[], None,
+        ).await.unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(70), cli.next_line()).await.is_err());
+        assert_eq!(cli.next_line().await.unwrap().as_deref(), Some("prefixsuffix"));
         cli.kill().await;
     }
 
