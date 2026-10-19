@@ -61,6 +61,24 @@ describe('Workflow Repair Git-backed AIS execution', () => {
       packDigest: 'c'.repeat(40), summary: '修复建议', itemResults: [] }))
       .toBe('441d2670ec7322879c1dd954da12c3ca2b98ef4c0b58cdb6262c9a621229903c');
   });
+  it('forwards draft purpose through the public adapter without weakening default baseline or Pack checks', async () => {
+    const f = fixture();
+    const deployedSpec = { id: 'wf', nodes: [{ id: 'changed-in-history' }] };
+    const row = { pack_id: 'pack', version: 4, deploy_number: 1, tag_name: 'deploy/wf/#1', spec_json: JSON.stringify(deployedSpec) };
+    const db = { query: async () => [row] } as unknown as IDatabase;
+    const execute = vi.fn();
+    const store = new RepairGitStore(f.reader);
+    const adapter = createRepairAisExecution(db, { execute } as unknown as AistudioService, store, 28720256);
+    await expect(adapter.resolveBaseline('wf', 'draft')).resolves.toMatchObject({
+      workflowId: 'wf', packId: 'pack', packCommit: f.baseline,
+      packDigest: f.git(f.source, 'rev-parse', 'HEAD^{tree}'), specPath: 'workflows/wf.yaml',
+      specDigest: createHash('sha256').update(f.spec).digest('hex'), proposalSpecDigest: digestRepairJson(deployedSpec),
+    });
+    await expect(adapter.resolveBaseline('wf')).rejects.toMatchObject({ code: 'SOURCE_CHANGED', details: { reasonCode: 'BASELINE_CONTENT_MISMATCH' } });
+    row.pack_id = 'wrong-pack';
+    await expect(adapter.resolveBaseline('wf', 'draft')).rejects.toThrow('expected Pack workflow');
+    expect(execute).not.toHaveBeenCalled();
+  });
   it('resolves a frozen active tag and reads only identity-bound Git result metadata', async () => {
     const f = fixture();
     const store = new RepairGitStore(f.reader);
@@ -69,7 +87,7 @@ describe('Workflow Repair Git-backed AIS execution', () => {
     const baseline = await store.baseline({ workflowId: 'wf', packId: 'pack', version: 4,
       deployNumber: 1, tagName: 'deploy/wf/#1', specJson: f.spec });
     expect(baseline).toMatchObject({ packCommit: f.baseline, releaseRevision: 4,
-      specDigest: createHash('sha256').update(f.spec).digest('hex'), specPath: 'workflows/wf.yaml' });
+      specDigest: createHash('sha256').update(f.spec).digest('hex'), proposalSpecDigest: digestRepairJson({ id: 'wf', nodes: [] }), specPath: 'workflows/wf.yaml' });
 
     writeFileSync(join(f.source, 'workflows/wf.yaml'), 'id: wf\nnodes: [fixed]\n');
     f.git(f.source, 'commit', '-qam', 'candidate');

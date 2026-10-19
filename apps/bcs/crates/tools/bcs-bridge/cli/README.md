@@ -15,6 +15,13 @@ bridge's `/webhook`) or as a **plugin** (the bridge dials the BCS Bot WebSocket
 `/ws/bot`). Each turn invokes an engine adapter and streams its
 output back to BCS as chat, thinking, tool and interaction (HITL) events.
 
+In plugin mode, every engine requests protocol V3 and `client_kind = "native_mcp"`
+in each `bot.connect` handshake, including reconnects. BCS still decides whether
+to enable MCP task coordination from the Bot's Provider policy or, for Bots
+without a Provider, the deployment's uplink permissions. On servers that require
+a matching client profile, the Provider must use `coordination.mode = "native_mcp"`;
+a `mcporter_mcp` Provider does not match this handshake. V2 fallback remains supported.
+
 ## Crates
 
 | Crate | Kind | Responsibility |
@@ -79,7 +86,7 @@ engine_bin = "/usr/local/bin/claude"
 cwd = "/home/me/workspace"
 # model = "..."
 # permission_mode = "..."      # engine-specific
-# engine_options = { ... }     # engine-specific; claude-code/codex accept none
+# engine_options = { ... }     # engine-specific, e.g. Codex sandbox/approval settings
 
 [registration]
 api_url = "https://bcs.example.com/prefix"
@@ -243,10 +250,21 @@ For intentional replacement, stop the bridge and use `register --replace-existin
 The CLI fences concurrent startup, retains a private rollback configuration
 beside the original. For the same Provider, API endpoint, mode, engine and Bot
 reference (omitted reference keeps the saved one), local settings are updated
-without registration; Bot ID, credentials, engine options and state are retained.
+without registration; Bot ID, credentials and state are retained.
 Changing the Provider, API endpoint or explicit Bot reference performs new
 registration and selects fresh state. Changing mode or engine for the same Bot
 is rejected. Failures leave the original local config intact.
+
+When replacing a configuration for the same engine, explicit
+`--engine-option NAME=VALUE` keys override the saved `engine_options`; omitted keys retain their
+saved values and TOML types. This applies both to local updates that keep the
+Bot UUID and to registrations that receive a new UUID. For example,
+`--replace-existing --engine-option sandbox=read-only` replaces a previously
+saved `sandbox = "danger-full-access"` without resetting other engine options.
+Omitting all `--engine-option` flags retains the saved options. The merged
+options are validated before registration or saving; invalid combinations fail
+without changing the original configuration. Options from a different engine
+are not inherited.
 
 Gateway webhook changes use the existing authenticated Provider PATCH API.
 Supply `BRIDGE_PROVIDER_ADMIN_TOKEN` or `--provider-admin-token`; a registration

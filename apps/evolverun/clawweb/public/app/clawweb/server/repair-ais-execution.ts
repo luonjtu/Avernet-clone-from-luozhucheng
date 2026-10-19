@@ -6,8 +6,8 @@ import { promisify } from 'node:util';
 import { parse as parseYaml } from 'yaml';
 import type { IDatabase } from '@avernet/clawweb-shared/server/db';
 import { WorkflowDeployHistoryRepository } from '@avernet/workflow/server/repositories/workflow-deploy-history-repository';
-import type { RepairBaseline } from '@avernet/workflow/server/contracts/repair-batch';
-import { canonicalRepairJson } from '@avernet/workflow/server/contracts/repair-batch';
+import { digestRepairJson, type RepairBaseline } from '@avernet/workflow/server/contracts/repair-batch';
+import { repairProposalSpecDigest } from '@avernet/workflow/server/contracts/repair-baseline-identity';
 import type { RepairExecutionPort, RepairExecutionReadRequest, RepairGeneratedResult } from '@avernet/workflow/server/contracts/repair-workbench';
 import { RepairResultAbsentError } from '@avernet/workflow/server/contracts/repair-workbench';
 import type { AistudioService } from '@avernet/clawinsight/server/services/aistudio-service';
@@ -69,7 +69,7 @@ export class RepairGitStore {
   }
 
   async baseline(row: { workflowId: string; packId: string; version: number; deployNumber: number;
-    tagName: string | null; specJson: string }): Promise<RepairBaseline> {
+    tagName: string | null; specJson: string }, purpose?: 'draft'): Promise<RepairBaseline> {
     if (!row.tagName || !/^deploy\/[A-Za-z0-9_-]+\/#\d+$/.test(row.tagName)) {
       throw new Error('Active deployment has no valid ClawFlows tag');
     }
@@ -85,12 +85,10 @@ export class RepairGitStore {
     const spec = await this.git(['show', `${commit}:${specPath}`]);
     const deployedSpec = parseYaml(row.specJson) as unknown;
     const taggedSpec = parseYaml(spec) as unknown;
-    if (canonicalRepairJson(taggedSpec) !== canonicalRepairJson(deployedSpec)) {
-      throw new Error('Active deployment spec differs from the tagged ClawFlows Pack');
-    }
+    const proposalSpecDigest = purpose === 'draft' ? digestRepairJson(deployedSpec) : repairProposalSpecDigest(taggedSpec, deployedSpec);
     return { workflowId: row.workflowId, packId: row.packId, releaseRevision: row.version,
       activeDeployNumber: row.deployNumber, specDigest: createHash('sha256').update(spec).digest('hex'),
-      repoId: 'clawflows', specPath, packCommit: commit, packDigest: tree };
+      proposalSpecDigest, repoId: 'clawflows', specPath, packCommit: commit, packDigest: tree };
   }
 
   async result(request: RepairExecutionReadRequest): Promise<RepairGeneratedResult> {
@@ -212,16 +210,16 @@ Promise<{ snapshotId: number; gitStore: RepairGitStore } | undefined> {
 export function createRepairAisExecution(db: IDatabase, ais: AistudioService,
   git: RepairGitStore, snapshotId: number): RepairExecutionPort {
   return {
-    async resolveBaseline(workflowId) {
+    async resolveBaseline(workflowId, purpose) {
       const row = await new WorkflowDeployHistoryRepository(db).findActiveByWorkflowId(workflowId);
       if (!row) throw new Error('Workflow has no active deployment');
       return git.baseline({ workflowId, packId: row.pack_id, version: row.version,
-        deployNumber: row.deploy_number, tagName: row.tag_name, specJson: row.spec_json });
+        deployNumber: row.deploy_number, tagName: row.tag_name, specJson: row.spec_json }, purpose);
     },
     async dispatch(request) {
       const envelope = { schemaVersion: 'clawevolve-task/v1', taskType: 'workflow_repair',
         taskId: request.input.taskId, stepId: request.identity.stepId, attempt: request.identity.attempt,
-        execution: { executor: 'ais', executionId: request.identity.executionId, action: 'generate_candidate' },
+        execution: { executor: 'ais', executionId: request.identity.executionId, action: request.input.integration ? 'integrate_candidate_v1' : 'generate_candidate' },
         input: request.input };
       const jobId = await ais.execute(request.actorId, { '${clawevolve_params}': JSON.stringify(envelope) }, snapshotId);
       return { jobId };
